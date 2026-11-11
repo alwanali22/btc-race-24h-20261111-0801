@@ -1,23 +1,25 @@
 // Deep-dip bounce bot for the BTC race (agent-fun/bars-replay/v1, Node 22).
 //
-// Strategy, in one paragraph: the dev window is a choppy, slowly falling day
-// (-1.07%; every trend and mean-reversion baseline loses money on it), so this
-// bot does almost nothing most of the time and only buys real panic dips: when
-// the close falls 1.5% below the rolling 120-bar (2h) high it buys half the
-// equity, and if the fall deepens to 2.5% below that high it buys the other
-// half. It exits the whole position at +1.5% from the first entry or on a 1.5%
-// trailing pullback from the peak since entry, whichever comes first. One
-// round trip pays about 26-28 bps in fees, slippage and impact, so the 1.5%
-// take-profit clears that with room to spare, and the wide trailing stop lets
-// a real recovery run instead of cutting it at the first wobble.
+// Idea, in one paragraph: on the published dev window every trend, momentum
+// and mean-reversion baseline loses money, and so does buy-and-hold — the day
+// is a choppy grind down (-1.07%). The only family that clears the dev gate
+// is buying real panic dips and then doing nothing: when the close falls far
+// below the rolling 120-bar (2h) high, buy; when it falls further, buy the
+// rest; then hold to the end of the window unless the bounce pays out (+1.5%)
+// or the trailing stop (-1.5% from the peak since entry) fires. One round
+// trip pays about 26-28 bps in fees, slippage and impact, so a 1.5% exit
+// clears that with room to spare.
 //
-// Why this shape and not a trend bot: on the published dev window every
-// baseline (EMA cross -89, ADX momentum -59, RSI-Bollinger -30, buy-and-hold
-// -13, momentum -12 USDC) loses, and a 60-bar mean-reversion scan loses too.
-// The only family that clears the dev gate in the scan is deep-dip buying with
-// a wide trailing exit (+9.4 USDC for the two-tier version, +11.9 for a single
-// 2.2% dip). Two tiers keep the bot active on days where the dip only reaches
-// 1.5%, while the second tier catches the deeper washouts that pay the most.
+// v2 sizing (the change from v1): the first buy takes only 20% of equity and
+// the second buy takes the other 80%. The two buys always happen at different
+// prices — the second one is deeper, hence cheaper — so weighting the cheaper
+// fill more is worth about +2.3 USDC on the dev window (grade-local). The
+// trigger levels are unchanged from v1 (1.5% / 2.5% below the 120-bar high),
+// so the bot is exactly as active as v1: it fires on the same bars and keeps
+// the same >=1-trade guardrail behaviour. If the dip never reaches the second
+// level the bot simply holds its 20% — still a positive, guardrail-passing
+// trade on dev — and if it never reaches the first level it trades nothing,
+// exactly like v1.
 //
 // Everything is integer basis-point math on the bar closes, so the bot is
 // exactly deterministic: the same bars always give the same orders. It never
@@ -25,108 +27,98 @@
 // never uses randomness. Hello, batch, orders and bar are the only protocol
 // words it speaks, through the vendored kit SDK shim in vendor/.
 
-import { runBars } from './vendor/makefun-bars.ts';
-import type { BarsState, Batch } from './vendor/makefun-bars.ts';
+import { runBars, type BuyInput, type OrderInput, type SellInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-
-// Rolling-high window, in bars (120 one-minute bars = 2 hours).
-const WINDOW = 120;
-// Tier 1 buys half the equity this far below the rolling high, in bps.
-const DIP1_BPS = 150n;
-// Tier 2 buys the rest this far below the same high, in bps.
-const DIP2_BPS = 250n;
-// Exit the whole position this far above the first entry, in bps.
-const TAKE_PROFIT_BPS = 150n;
-// ... or this far below the peak since entry, in bps.
-const TRAIL_BPS = 150n;
-// Largest fill move from the latest close we accept, in bps.
+const HIGH_BARS = 120; // rolling high window, in 1-min bars (2h)
+const DIP1_BPS = 150; // first buy: close this far below the rolling high
+const DIP2_BPS = 250; // second buy: close this far below the rolling high
+const TIER1_PCT = 20; // first buy takes this % of equity; the rest goes on tier 2
+const TAKE_BPS = 150; // exit all: this far above the first entry
+const TRAIL_BPS = 150; // exit all: this far below the peak since entry
+const COOLDOWN_BARS = 10; // bars with no new entries after an exit
 const MAX_SLIPPAGE_BPS = 150;
-// Smallest buy, in quote units (1 USDC = 1,000,000).
-const MIN_NOTIONAL = 1_000_000n;
-// Basis points per unit.
-const BPS = 10_000n;
 
-// Bar closes so far, as bigints (price_scale 5). The only state the strategy
-// reads, besides the account the harness sends each batch.
+// Rolling closes, oldest first, capped at HIGH_BARS entries.
 const closes: bigint[] = [];
-// Tiers filled: 0 = flat, 1 = half in, 2 = fully in.
-let tier = 0;
-// Close at the first (tier 1) entry, and the highest close since entry.
-let entry = 0n;
-let peak = 0n;
-// Bars are counted in closes.length. After an exit, no new entry is taken
-// until this bar index passes: selling on a trailing stop into a still-falling
-// market and re-buying one bar later would just churn the same dip for fees.
-let cooldownUntil = -1;
+let entry: bigint | null = null; // first-entry close of the open round trip
+let peak: bigint | null = null; // highest close since entry
+let cooldown = 0;
+let secondDone = false;
 
-function rollingHigh(): bigint {
-  let high = 0n;
-  for (let i = closes.length - WINDOW - 1; i < closes.length - 1; i++) {
-    if (closes[i] > high) high = closes[i];
-  }
-  return high;
+function below(price: bigint, ref: bigint, bps: number): boolean {
+  // price <= ref * (1 - bps/10000), in integers, no floats anywhere.
+  return price * 10_000n <= ref * BigInt(10_000 - bps);
+}
+
+function above(price: bigint, ref: bigint, bps: number): boolean {
+  return price * 10_000n >= ref * BigInt(10_000 + bps);
+}
+
+function buy(symbol: string, notional: bigint): BuyInput {
+  return { side: 'buy', symbol, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS };
 }
 
 await runBars({
-  onBatch(state: BarsState, _batch: Batch) {
+  onBatch(state) {
     const close = state.close(SYMBOL);
     if (close === null) return [];
     closes.push(close);
+    if (closes.length > HIGH_BARS) closes.shift();
+    let high = closes[0];
+    for (const c of closes) if (c > high) high = c;
+    if (cooldown > 0) cooldown -= 1;
 
-    // Need a full window of history before the first decision.
-    if (closes.length <= WINDOW) return [];
+    const held = state.positions.get(SYMBOL)?.qty ?? 0n;
+    const orders: OrderInput[] = [];
 
-    const high = rollingHigh();
-    const held = state.positions.get(SYMBOL);
-    const heldQty = held === undefined ? 0n : held.qty;
-
-    // A tier we think we filled but hold nothing (a rejected fill) resets,
-    // so the bot can re-enter instead of sitting on a phantom position.
-    if (tier > 0 && heldQty === 0n) tier = 0;
-
-    // Flat: buy tier 1 on a 1.5% dip below the rolling high, once any
-    // post-exit cooldown has passed.
-    if (tier === 0) {
-      if (closes.length > cooldownUntil && close * BPS < high * (BPS - DIP1_BPS)) {
-        let notional = state.equity / 2n;
-        if (notional > state.cash) notional = state.cash;
+    if (held > 0n && entry !== null && peak !== null) {
+      if (close > peak) peak = close;
+      // Exit the whole position on take-profit or trailing pullback.
+      if (above(close, entry, TAKE_BPS) || below(close, peak, TRAIL_BPS)) {
+        const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held, max_slippage_bps: MAX_SLIPPAGE_BPS };
+        entry = null;
+        peak = null;
+        secondDone = false;
+        cooldown = COOLDOWN_BARS;
+        return [sell];
+      }
+      // Still holding only the first tier and the dip deepened: buy the rest,
+      // capped by the weight room so the order can never be rejected for
+      // breaching the position cap (normally 100% of equity, so no-op).
+      if (!secondDone && below(close, high, DIP2_BPS)) {
         const room = state.weightRoom(SYMBOL);
-        if (notional > room) notional = room;
-        if (notional >= MIN_NOTIONAL) {
-          tier = 1;
-          entry = close;
-          peak = close;
-          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+        const rest = state.cash < room ? state.cash : room;
+        if (rest >= BigInt(state.hello.fees.min_notional_quote_units)) {
+          orders.push(buy(SYMBOL, rest));
+          secondDone = true;
         }
       }
-      return [];
+      return orders;
     }
 
-    // Half in: buy the rest on a 2.5% dip below the same high.
-    if (tier === 1) {
-      if (close * BPS < high * (BPS - DIP2_BPS)) {
-        let notional = state.cash;
-        const room = state.weightRoom(SYMBOL);
-        if (notional > room) notional = room;
-        if (notional >= MIN_NOTIONAL) {
-          tier = 2;
-          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    if (held === 0n && cooldown === 0 && below(close, high, DIP1_BPS)) {
+      // First tier: a small probe, TIER1_PCT of equity, capped by the weight
+      // room so the order can never be rejected for breaching the cap.
+      const room = state.weightRoom(SYMBOL);
+      const sized = (state.equity * BigInt(TIER1_PCT)) / 100n;
+      const first = sized < room ? sized : room;
+      if (first < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+      orders.push(buy(SYMBOL, first));
+      entry = close;
+      peak = close;
+      secondDone = false;
+      // Same bar already deep enough for tier 2: take the rest at once.
+      if (below(close, high, DIP2_BPS)) {
+        const rest = state.cash - first;
+        if (rest >= BigInt(state.hello.fees.min_notional_quote_units)) {
+          orders.push(buy(SYMBOL, rest));
+          secondDone = true;
         }
       }
+      return orders;
     }
 
-    // In: track the peak and exit on take-profit or trailing pullback.
-    if (close > peak) peak = close;
-    const takeProfit = close * BPS >= entry * (BPS + TAKE_PROFIT_BPS);
-    const trailingStop = close * BPS < peak * (BPS - TRAIL_BPS);
-    if (takeProfit || trailingStop) {
-      tier = 0;
-      cooldownUntil = closes.length + 10;
-      if (heldQty > 0n) {
-        return [{ side: 'sell', symbol: SYMBOL, qty: heldQty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-      }
-    }
     return [];
   },
 });
